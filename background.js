@@ -6,10 +6,15 @@
  * Released under the terms of GPLv3+.
  */
 
+'use strict';
+/* jshint browser:true, devel:true, eqnull:true */
+/* globals chrome, JXG, MarketSession */
+
 /**
  * URL used for requesting a special download token.
  */
 var API_URL = "https://android.clients.google.com/market/api/ApiRequest";
+var FDFE_URL_BASE = "https://android.clients.google.com/fdfe/";
 
 function showLastError() {
     console.log("chrome.extension.lastError", chrome.extension.lastError);
@@ -73,7 +78,7 @@ function strToHex(str) {
  */
 function processAsset(asset_query_base64, packageName, tabId) {
     if (typeof tabId !== 'number') {
-        throw Error('processAsset: tabId must be a number');
+        throw new Error('processAsset: tabId must be a number');
     }
     chrome.cookies.getAllCookieStores(function(cookieStores) {
         var i, cookieStore;
@@ -97,6 +102,17 @@ function _real_processAsset(asset_query_base64, packageName, storeId, tabId) {
     xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
     xhr.onload = function() {
         removeAPICookie(storeId, function() {
+            if (xhr.status == 403) {
+                hasValidSession(function(isValid) {
+                    if (isValid) {
+                        alert("Cannot download app, maybe it is a paid one or something?");
+                    } else {
+                        alert("Session expired, please re-login");
+                        openTab("options.html");
+                    }
+                });
+                return;
+            }
             if (xhr.status != 200) {
                 alert("ERROR: Cannot download this app!\n" + xhr.status + " " +
                     xhr.statusText);
@@ -147,13 +163,87 @@ function downloadAPK(marketda, url, filename, storeId, tabId) {
 }
 
 /**
+ * Determine whether a valid session is available. If the callback is called
+ * with "false" as first argument, then it is 100% sure that the session is
+ * invalid.
+ */
+function hasValidSession(callback) {
+    var authToken = localStorage.getItem("authToken");
+    if (authToken == null) {
+        callback(false);
+        return;
+    }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", FDFE_URL_BASE + "delivery");
+    /* GoogleLogin auth=... is required, otherwise you get a 302 which is
+     * uncatchable */
+    xhr.setRequestHeader("Authorization", "GoogleLogin auth=" + authToken);
+    xhr.onload = function () {
+        console.log("xhr status " + xhr.status);
+        if (xhr.status == 401) {
+            /* 401 Unauthorized: invalid login token */
+            localStorage.removeItem("authToken");
+            callback(false);
+        } else {
+            /* assume valid session for other status codes (400, ???) */
+            callback(true);
+        }
+    };
+    xhr.onerror = function () {
+        console.log("Unable to test session for validity, assuming valid one");
+        callback(true);
+    };
+    xhr.send(null);
+}
+/* Try to focus existing options page or open a new tab for it */
+function openTab(url) {
+    chrome.tabs.query({
+        url: url
+    }, function(tabs) {
+        if (tabs.length > 0) {
+            focusTab(tabs[0]);
+        } else {
+            chrome.tabs.create({
+                url: url,
+                active: true
+            }, focusTab);
+        }
+
+        function focusTab(tab) {
+            chrome.windows.update(tab.windowId, {
+                focused: true
+            });
+        }
+    });
+}
+
+/**
  * When a tab is loaded, show the APK Downloader icon if on the market page.
  */
 chrome.extension.onMessage.addListener(function (message, sender, sendResponse) {
     if (message && message.action == "showIcon") {
-        chrome.pageAction.show(sender.tab.id);
+        if (message.show) {
+            chrome.pageAction.show(sender.tab.id);
+        } else {
+            chrome.pageAction.hide(sender.tab.id);
+        }
     }
 });
+var checkMarketPage = function(details) {
+    var tabId = details.tabId;
+    chrome.tabs.sendMessage(tabId, {
+        action: 'checkButtonState'
+    });
+};
+var urlFilter = {
+    url: [{
+        hostEquals: "play.google.com",
+        pathPrefix: "/store/apps/details",
+    }]
+};
+chrome.webNavigation.onHistoryStateUpdated.addListener(checkMarketPage, urlFilter);
+
 
 chrome.pageAction.onClicked.addListener(function (tab) {
     var match = /play\.google\.com\/store\/apps\/details\?(?:|.*&)id=([\w\d\.\_]+)/i.exec(tab.url);
